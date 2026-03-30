@@ -1,107 +1,72 @@
-import time
-import collections
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import AveragePooling2D
+from tensorflow.keras.layers import Dropout
+from tensorflow.keras.layers import Flatten
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.layers import Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.preprocessing.image import img_to_array
+from tensorflow.keras.preprocessing.image import load_img
+from tensorflow.keras.utils import to_categorical
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from imutils import paths
+import matplotlib.pyplot as plt
 import numpy as np
-import config
+import os
 
-try:
-    from deepface import DeepFace
-    DEEPFACE_AVAILABLE = True
-except ImportError:
-    DEEPFACE_AVAILABLE = False
-    print("[EmotionDetector] deepface not installed — emotion detection disabled.")
+INIT_LR = 1e-4
+EPOCHS = 20
+BS = 32
 
+DIRECTORY = r"dataset"
+CATEGORIES = ["with_mask", "without_mask"]
 
-EMOTION_STRESS_WEIGHT = {
-    "angry":    1.00,
-    "fear":     0.85,
-    "disgust":  0.75,
-    "sad":      0.45,
-    "surprise": 0.30,
-    "neutral":  0.10,
-    "happy":    0.00,
-}
+feature_set = []
+target_labels = []
 
-EMOJI_MAP = {
-    "angry":    "😠",
-    "fear":     "😨",
-    "disgust":  "🤢",
-    "sad":      "😢",
-    "surprise": "😲",
-    "neutral":  "😐",
-    "happy":    "😊",
-    "unknown":  "❓",
-}
+for category in CATEGORIES:
+    path = os.path.join(DIRECTORY, category)
+    for img in os.listdir(path):
+        img_path = os.path.join(path, img)
+        image = load_img(img_path, target_size=(224, 224))
+        image = img_to_array(image)
+        image = preprocess_input(image)
+        feature_set.append(image)
+        target_labels.append(category)
 
+lb = LabelBinarizer()
+target_labels = lb.fit_transform(target_labels)
+target_labels = to_categorical(target_labels)
 
-class EmotionDetector:
-    def __init__(self):
-        self._last_analysis_time = 0.0
-        self._cached_result      = {
-            "emotion":       "unknown",
-            "emotion_emoji": "❓",
-            "all_emotions":  {},
-            "stress_level":  "LOW",
-            "emotion_score": 0.0,
-            "is_high_stress": False,
-        }
-        self._history = collections.deque(maxlen=config.EMOTION_HISTORY_LEN)
-        self.emotion_score = 0.0
+feature_set = np.array(feature_set, dtype="float32")
+target_labels = np.array(target_labels)
 
-    def process(self, frame_bgr):
+(trainX, testX, trainY, testY) = train_test_split(feature_set, target_labels, test_size=0.20, stratify=target_labels, random_state=42)
 
-        now = time.time()
-        if now - self._last_analysis_time < config.EMOTION_INTERVAL_SEC:
-            return self._cached_result
+aug = ImageDataGenerator(rotation_range=20, zoom_range=0.15, width_shift_range=0.2, height_shift_range=0.2, shear_range=0.15, horizontal_flip=True, fill_mode="nearest")
 
-        self._last_analysis_time = now
+base_model = MobileNetV2(weights="imagenet", include_top=False, input_tensor=Input(shape=(224, 224, 3)))
 
-        if not DEEPFACE_AVAILABLE:
-            return self._cached_result
+head_model = base_model.output
+head_model = AveragePooling2D(pool_size=(7, 7))(head_model)
+head_model = Flatten(name="flatten")(head_model)
+head_model = Dense(128, activation="relu")(head_model)
+head_model = Dropout(0.5)(head_model)
+head_model = Dense(2, activation="softmax")(head_model)
 
-        try:
-            analysis = DeepFace.analyze(
-                frame_bgr,
-                actions=["emotion"],
-                enforce_detection=False,
-                silent=True,
-            )
+classifier_model = Model(inputs=base_model.input, outputs=head_model)
 
-            if isinstance(analysis, list):
-                analysis = analysis[0]
+for layer in base_model.layers:
+    layer.trainable = False
 
-            dominant  = analysis.get("dominant_emotion", "unknown")
-            all_emo   = analysis.get("emotion", {})
+opt = Adam(learning_rate=INIT_LR, decay=INIT_LR / EPOCHS)
+classifier_model.compile(loss="binary_crossentropy", optimizer=opt, metrics=["accuracy"])
 
-            stress_raw = sum(
-                (prob / 100.0) * EMOTION_STRESS_WEIGHT.get(emo, 0.0)
-                for emo, prob in all_emo.items()
-                if emo in EMOTION_STRESS_WEIGHT
-            )
+H = classifier_model.fit(aug.flow(trainX, trainY, batch_size=BS), steps_per_epoch=len(trainX) // BS, validation_data=(testX, testY), validation_steps=len(testX) // BS, epochs=EPOCHS)
 
-            stress_score = stress_raw * 100.0
-
-            stress_score = max(0.0, min(100.0, stress_score))
-
-            self._history.append(stress_score)
-            self.emotion_score = float(np.mean(self._history))
-
-            is_high = dominant in config.HIGH_STRESS_EMOTIONS
-
-            self._cached_result = {
-                "emotion":        dominant,
-                "emotion_emoji":  EMOJI_MAP.get(dominant, "❓"),
-                "all_emotions":   {k: round(v, 1) for k, v in all_emo.items()},
-                "stress_level":   "HIGH" if is_high else "NORMAL",
-                "emotion_score":  round(self.emotion_score, 1),
-                "is_high_stress": is_high,
-            }
-
-        except Exception:
-            pass
-
-        return self._cached_result
-
-    def reset(self):
-        self.emotion_score = 0.0
-        self._history.clear()
-        self._last_analysis_time = 0.0
+classifier_model.save("mask_detector.model", save_format="h5")
